@@ -195,7 +195,7 @@ wheels = [
 [[package]]
 name = "eaf-base-api"
 version = "4.1.1"
-source = { editable = "../eaf_base_api" }
+source = { directory = "../eaf_base_api" }
 dependencies = [
     { name = "cachetools" },
     { name = "curl-cffi" },
@@ -357,7 +357,7 @@ requires-dist = [
     { name = "av", marker = "extra == 'av'" },
     { name = "chompjs" },
     { name = "curl-cffi" },
-    { name = "eaf-base-api", editable = "../eaf_base_api" },
+    { name = "eaf-base-api", directory = "../eaf_base_api" },
     { name = "m3u8" },
     { name = "selectolax" },
 ]
