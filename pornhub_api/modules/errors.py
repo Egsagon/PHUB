@@ -13,7 +13,7 @@ class VideoDisabled(PornhubAPIError):
     pass
 
 
-class LoginFailed(PornhubAPIError):
+class LoginFailed(base_errors.LoginFailed, PornhubAPIError):
     pass
 
 

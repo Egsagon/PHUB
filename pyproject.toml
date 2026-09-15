@@ -41,7 +41,7 @@ dependencies = [
   "m3u8",
   "chompjs",
   "selectolax",
-  "eaf-base-api>=4.0.0",
+  "eaf-base-api>=4.2.0",
   "curl-cffi",
 ]
 

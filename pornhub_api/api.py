@@ -20,13 +20,14 @@ import os
 import re
 import html
 import json
-import copy
 import chompjs
 import logging
 import asyncio
 import argparse
 
-from base_api.modules.logger import configure_app_logging
+from pornhub_api.modules import errors as provider_errors
+from base_api.modules.provider import fetch_content, download_errors, prepare_download_config
+from base_api.modules.logger import configure_app_logging, get_logger, log_context
 
 from contextlib import aclosing
 from dataclasses import dataclass
@@ -50,14 +51,7 @@ from base_api import (
     scrape_stream as _scrape_stream,
     str_to_bool,
 )
-from base_api.modules.errors import (
-    DownloadCancelled,
-    BotProtectionDetected,
-    HTTPStatusError,
-    InvalidProxy,
-    NetworkRequestError,
-    UnknownError,
-)
+from base_api.modules.errors import DownloadCancelled
 
 from pornhub_api.modules.errors import (
     NetworkError,
@@ -88,8 +82,7 @@ from pornhub_api.modules.consts import (
 )
 
 
-logger = logging.getLogger("PornHub API")
-logger.addHandler(logging.NullHandler())
+logger = get_logger(__name__)
 
 MediaT = TypeVar("MediaT", bound=BaseMedia)
 
@@ -109,53 +102,22 @@ def build_m3u8_master(media_definitions: list[dict] | None) -> str | None:
     return '\n'.join(lines)
 
 
+@download_errors(DownloadFailed)
 async def _download_hls(media: BaseMedia, configuration: DownloadConfigHLS) -> bool | DownloadReport:
-    try:
-        await media.load_fields("title", "m3u8_base_url")
-        if not media.m3u8_base_url:
-            raise DownloadFailed(f"No m3u8 playlist found for {media.url}")
-        media_title = media.title or f"{type(media).__name__.lower()}_{getattr(media, 'video_key', None) or getattr(media, 'video_id', None) or 'unknown'}"
-        logger.info(f"Downloading {type(media).__name__} {media_title} to {configuration.path}")
-        config = copy.deepcopy(configuration)
-        config.m3u8_base_url = media.m3u8_base_url
-        if not config.no_title:
-            config.path = os.path.join(config.path, f"{strip_title(media_title)}.mp4")
+    await media.load_fields("title", "m3u8_base_url")
+    if not media.m3u8_base_url:
+        raise DownloadFailed(f"No m3u8 playlist found for {media.url}")
+    media_title = media.title or f"{type(media).__name__.lower()}_{getattr(media, 'video_key', None) or getattr(media, 'video_id', None) or 'unknown'}"
+    logger.info(f"Downloading {type(media).__name__} {media_title} to {configuration.path}")
+    config = prepare_download_config(configuration, strip_title(media_title))
+    config.m3u8_base_url = media.m3u8_base_url
 
-        return await media.core.download(configuration=config)
-    except DownloadCancelled:
-        raise
-    except Exception as e:
-        logger.exception("Download failed for %s: %s", media.url, e)
-        raise DownloadFailed(f"Download failed for {media.url}: {e}") from e
+    return await media.core.download(configuration=config)
 
 
-async def get_html_content(core: BaseCore, url: str) -> str:
-    logger.debug(f"Fetching HTML content for {url}")
-    try:
-        content = await core.fetch_text(url)
-        logger.debug(f"Successfully fetched HTML from {url} ({len(content)} bytes)")
-        return content
-    except HTTPStatusError as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        if e.status_code == 404:
-            raise NotFound(f"Server returned 404 for: {url}") from e
-        raise NetworkError(f"Request failed for {url}: {e}") from e
-    except NetworkRequestError as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        raise NetworkError(f"Request failed for {url}: {e}") from e
-    except InvalidProxy as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        raise ProxyError(f"Request failed for {url}: {e}") from e
-    except BotProtectionDetected as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        raise BotDetection(f"Request failed for {url}: {e}") from e
-    except UnknownError as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        raise UnknownNetworkError(f"Request failed for {url}: {e}") from e
-
-    except Exception:
-        logger.exception("Failed to fetch or decode response for %s", url)
-        raise
+async def get_html_content(core: BaseCore, url: str, *, owner=None) -> str:
+    return await fetch_content(core, url, logger=logger, owner=owner,
+                               error_types=provider_errors)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -207,7 +169,7 @@ class UserHelper(BaseMedia):
 
     async def _load_html(self) -> dict[str, object]:
         logger.debug(f"Fetching HTML for UserHelper at {self.url}")
-        html_content = await get_html_content(core=self.core, url=self.url)
+        html_content = await get_html_content(core=self.core, url=self.url, owner=self)
         return await asyncio.to_thread(self._extract_html, html_content, self.url)
 
     @staticmethod
@@ -608,7 +570,7 @@ class Album(BaseMedia):
 
     async def _load_html(self) -> dict[str, object]:
         logger.debug(f"Fetching HTML for Album at {self.url}")
-        html_content = await get_html_content(core=self.core, url=self.url)
+        html_content = await get_html_content(core=self.core, url=self.url, owner=self)
         return await asyncio.to_thread(self._extract_html, html_content, self.url)
 
     @staticmethod
@@ -626,7 +588,7 @@ class Album(BaseMedia):
                 if "securityId" in widget_data:
                     album_id = str(widget_data["securityId"])
             except Exception:
-                pass
+                logger.warning("Failed to parse album widget metadata", exc_info=True)
         if not album_id:
             m = re.search(r"var\s+origin(?:Url|Part)\s*=\s*['\"][^'\"]*album/(\d+)", html_content)
             if m:
@@ -674,7 +636,7 @@ class Album(BaseMedia):
                     top_data = json.loads(top_body.group(1))
                     token = top_data.get("token")
                 except Exception:
-                    pass
+                    logger.warning("Failed to parse album token metadata", exc_info=True)
         if not token:
             m = re.search(r"['\"]?token['\"]?\s*:\s*['\"]([^'\"]+)['\"]", html_content)
             if m:
@@ -976,20 +938,21 @@ class Album(BaseMedia):
         logger.info(f"Fetching photos for Album at {self.url} (pages: {pages})")
         base_url = self.url.split("?")[0]
         page_urls = [f"{base_url.rstrip('/')}?page={page}" for page in range(1, pages + 1)]
-        html_contents = await asyncio.gather(*(get_html_content(core=self.core, url=url) for url in page_urls))
+        html_contents = await asyncio.gather(*(get_html_content(core=self.core, url=url, owner=self) for url in page_urls))
         for html in html_contents:
             for photo_data in self._parse_photos(html):
                 yield photo_data
 
     async def download_photo(self, url: str, path: str) -> bool:
-        logger.info(f"Downloading photo {url} to {path}")
-        try:
-            return await self.core.legacy_download(url=url, configuration=DownloadConfigRAW(path=path, quality="best"))
-        except DownloadCancelled:
-            raise
-        except Exception as e:
-            logger.exception("Photo download failed for %s (album=%s, output=%s)", url, self.url, path)
-            raise DownloadFailed(f"Photo download failed for {url} (album={self.url}): {e}") from e
+        with log_context(self, url):
+            logger.info(f"Downloading photo {url} to {path}")
+            try:
+                return await self.core.legacy_download(url=url, configuration=DownloadConfigRAW(path=path, quality="best"))
+            except DownloadCancelled:
+                raise
+            except Exception as e:
+                logger.exception("Photo download failed for %s (album=%s, output=%s)", url, self.url, path)
+                raise DownloadFailed(f"Photo download failed for {url} (album={self.url}): {e}") from e
 
 
 @dataclass(kw_only=True, slots=True)
@@ -1038,7 +1001,7 @@ class Short(BaseMedia):
 
     async def _load_html(self) -> dict[str, object]:
         logger.debug(f"Fetching HTML for Short at {self.url}")
-        html_content = await get_html_content(core=self.core, url=self.url)
+        html_content = await get_html_content(core=self.core, url=self.url, owner=self)
         return await asyncio.to_thread(self._extract_html, html_content)
 
     def _extract_html(self, html_content: str | None = None, url: str | None = None) -> dict:
@@ -1064,7 +1027,7 @@ class Short(BaseMedia):
                         if isinstance(parsed, list):
                             parsed_shorties = [s for s in parsed if isinstance(s, dict)]
                     except Exception as e:
-                        logger.debug(f"Failed to parse JSON_SHORTIES directly from bracket: {e}")
+                        logger.debug(f"Failed to parse JSON_SHORTIES directly from bracket: {e}", exc_info=True)
                         m = re.search(r'JSON_SHORTIES\s*=\s*insertAfterNthPosition\((.*?), prerollObject', html_str, re.DOTALL)
                         if m:
                             try:
@@ -1072,7 +1035,7 @@ class Short(BaseMedia):
                                 if isinstance(parsed, list):
                                     parsed_shorties = [s for s in parsed if isinstance(s, dict)]
                             except Exception:
-                                pass
+                                logger.warning("Failed to parse short video metadata", exc_info=True)
 
         # 2. Match target vkey / videoId from URL if present
         requested_vkey = None
@@ -1401,7 +1364,7 @@ class GIF(BaseMedia):
 
     async def _load_html(self) -> dict[str, object]:
         logger.debug(f"Fetching HTML for GIF at {self.url}")
-        html_content = await get_html_content(core=self.core, url=self.url)
+        html_content = await get_html_content(core=self.core, url=self.url, owner=self)
         if "GIF is unavailable pending review." in html_content:
             raise GifPendingReview("The GIF is still pending a review and can't be downloaded yet...")
         if "This video has been disabled" in html_content:
@@ -1425,7 +1388,7 @@ class GIF(BaseMedia):
             try:
                 script = json.loads(script_node.text())
             except Exception:
-                pass
+                logger.warning("Failed to parse GIF JSON-LD metadata", exc_info=True)
 
         # Scope to main GIF containers to avoid matching header/footer navigation
         gif_wrap = lexbor.css_first("div#gifWrap")
@@ -1700,23 +1663,16 @@ class GIF(BaseMedia):
             await video.load_sources("html")
         return video
 
+    @download_errors(DownloadFailed)
     async def download(self, configuration: DownloadConfigRAW) -> bool:
-        try:
-            await self.load_fields("title", "content_url")
-            if not self.content_url:
-                raise DownloadFailed(f"No content_url available for GIF at {self.url}")
-            title = self.title or f"gif_{self.gif_id or 'unknown'}"
-            logger.info(f"Downloading GIF {title} to {configuration.path}")
-            config = copy.deepcopy(configuration)
-            if not config.no_title:
-                config.path = os.path.join(config.path, f"{strip_title(title)}.mp4")
+        await self.load_fields("title", "content_url")
+        if not self.content_url:
+            raise DownloadFailed(f"No content_url available for GIF at {self.url}")
+        title = self.title or f"gif_{self.gif_id or 'unknown'}"
+        logger.info(f"Downloading GIF {title} to {configuration.path}")
+        config = prepare_download_config(configuration, strip_title(title))
 
-            return await self.core.legacy_download(url=self.content_url, configuration=config)
-        except DownloadCancelled:
-            raise
-        except Exception as e:
-            logger.exception("Download failed for %s: %s", self.url, e)
-            raise DownloadFailed(f"Download failed for {self.url}: {e}") from e
+        return await self.core.legacy_download(url=self.content_url, configuration=config)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -1748,7 +1704,7 @@ class Channel(BaseMedia):
 
     async def _load_html(self) -> dict[str, object]:
         logger.debug(f"Fetching HTML for Channel at {self.url}")
-        html_content = await get_html_content(core=self.core, url=self.url)
+        html_content = await get_html_content(core=self.core, url=self.url, owner=self)
         return await asyncio.to_thread(self._extract_html, html_content)
 
     def _extract_html(self, html_content: str | None = None) -> dict:
@@ -2042,7 +1998,7 @@ class Playlist(BaseMedia):
 
     async def _load_html(self) -> dict[str, object]:
         logger.debug(f"Fetching HTML for Playlist at {self.url}")
-        html_content = await get_html_content(core=self.core, url=self.url)
+        html_content = await get_html_content(core=self.core, url=self.url, owner=self)
         return await asyncio.to_thread(self._extract_html, html_content)
 
     def _extract_html(self, html_content: str) -> dict:
@@ -2056,7 +2012,7 @@ class Playlist(BaseMedia):
             try:
                 playlist_view = json.loads(pv_match.group(1))
             except Exception:
-                pass
+                logger.warning("Failed to parse playlist metadata", exc_info=True)
 
         # 2. Token
         token = None
@@ -2447,12 +2403,12 @@ class Video(BaseMedia):
 
     async def _load_html(self) -> dict[str, object]:
         logger.debug(f"Fetching HTML for Video at {self.url}")
-        html_content = await get_html_content(core=self.core, url=self.url)
+        html_content = await get_html_content(core=self.core, url=self.url, owner=self)
         return await asyncio.to_thread(self._extract_html, html_content, self.url)
 
     async def _load_api(self) -> dict[str, object]:
         logger.debug(f"Fetching API data for Video {self.video_id}")
-        stuff = await get_html_content(url=f"https://www.pornhub.com/webmasters/video_by_id?id={self.video_id}", core=self.core)
+        stuff = await get_html_content(url=f"https://www.pornhub.com/webmasters/video_by_id?id={self.video_id}", core=self.core, owner=self)
         return await asyncio.to_thread(self._extract_api, stuff)
 
     @staticmethod
@@ -2471,7 +2427,7 @@ class Video(BaseMedia):
                 try:
                     flashvars = chompjs.parse_js_object(raw_fv)
                 except Exception as e:
-                    logger.warning("Failed to parse flashvars JSON for %s: %s", url, e)
+                    logger.warning("Failed to parse flashvars JSON for %s: %s", url, e, exc_info=True)
 
         video_show: dict[str, Any] = {}
         match_vs = re.search(r"var\s+VIDEO_SHOW\s*=\s*(\{.*?\});", html_content, re.DOTALL)
@@ -2483,7 +2439,7 @@ class Video(BaseMedia):
                 try:
                     video_show = chompjs.parse_js_object(raw_vs)
                 except Exception as e:
-                    logger.debug("Failed to parse VIDEO_SHOW for %s: %s", url, e)
+                    logger.warning("Failed to parse VIDEO_SHOW for %s: %s", url, e, exc_info=True)
 
         ratings_widget: dict[str, Any] = {}
         match_rw = re.search(r"var\s+WIDGET_RATINGS_LIKE_FAV\s*=\s*(\{.*?\});", html_content, re.DOTALL)
@@ -2495,7 +2451,7 @@ class Video(BaseMedia):
                 try:
                     ratings_widget = chompjs.parse_js_object(raw_rw)
                 except Exception:
-                    pass
+                    logger.warning("Failed to parse ratings metadata", exc_info=True)
 
         schema_json: dict[str, Any] = {}
         for s in parser.css('script[type="application/ld+json"]'):
@@ -2505,6 +2461,7 @@ class Video(BaseMedia):
                     schema_json = parsed_schema
                     break
             except Exception:
+                logger.warning("Failed to parse video JSON-LD metadata for %s", url, exc_info=True)
                 continue
 
         meta_tags: dict[str, str] = {}
@@ -2932,63 +2889,69 @@ class Client:
         return client
 
     async def login(self, force: bool = False, throw: bool = True) -> bool:
-        logger.info("Attempting login")
+        with log_context(self, f"{HOST}front/authenticate"):
+            try:
+                logger.info("Attempting login")
 
-        if not force and self.logged:
-            if throw:
-                raise ClientAlreadyLogged()
-            return True
+                if not force and self.logged:
+                    if throw:
+                        raise ClientAlreadyLogged()
+                    return True
 
-        if not self.credentials["email"] or not self.credentials["password"]:
-            if throw:
-                raise LoginFailed("Email and password are required")
-            return False
+                if not self.credentials["email"] or not self.credentials["password"]:
+                    if throw:
+                        raise LoginFailed("Email and password are required")
+                    return False
 
-        page_content = await get_html_content(url=HOST, core=self.core)
-        match = REGEX_TOKEN.search(page_content)
-        if not match:
-            if throw:
-                raise LoginFailed("Could not find login token")
-            return False
+                page_content = await get_html_content(url=HOST, core=self.core, owner=self)
+                match = REGEX_TOKEN.search(page_content)
+                if not match:
+                    if throw:
+                        raise LoginFailed("Could not find login token")
+                    return False
 
-        token = match.group(1)
-        payload = LOGIN_PAYLOAD | self.credentials | {"token": token}
-        url = f"{HOST}front/authenticate"
-        try:
-            response = await self.core.request(url, method="POST", data=payload)
-            data = response.json()
-        except Exception as e:
-            logger.exception("Login request failed for %s", url)
-            if throw:
-                raise LoginFailed(f"Login request failed for {url}: {e}") from e
-            return False
+                token = match.group(1)
+                payload = LOGIN_PAYLOAD | self.credentials | {"token": token}
+                url = f"{HOST}front/authenticate"
+                try:
+                    response = await self.core.request(url, method="POST", data=payload)
+                    data = response.json()
+                except Exception as e:
+                    logger.exception("Login request failed for %s", url)
+                    if throw:
+                        raise LoginFailed(f"Login request failed for {url}: {e}") from e
+                    return False
 
-        if not int(data.get("success", 0)):
-            if throw:
-                raise LoginFailed(data.get("message", "Unknown error"))
-            return False
+                if not int(data.get("success", 0)):
+                    if throw:
+                        raise LoginFailed(data.get("message", "Unknown error"))
+                    return False
 
-        self.account.connect(data)
-        self.logged = True
-        return True
+                self.account.connect(data)
+                self.logged = True
+                return True
+            except Exception:
+                logger.exception("Login failed")
+                raise
 
     async def fix_recommendations(self) -> bool:
-        if not self.logged:
-            return False
+        with log_context(self, f"{HOST}user/log_user_cookie_consent"):
+            if not self.logged:
+                return False
 
-        logger.info("Fixing account recommendations")
-        page_content = await get_html_content(url=HOST, core=self.core)
-        match = REGEX_TOKEN.search(page_content)
-        if not match:
-            return False
+            logger.info("Fixing account recommendations")
+            page_content = await get_html_content(url=HOST, core=self.core, owner=self)
+            match = REGEX_TOKEN.search(page_content)
+            if not match:
+                return False
 
-        params = {'token': match.group(1), 'cookie_selection': 3, 'site_id': 1}
-        try:
-            response = await self.core.request(f"{HOST}user/log_user_cookie_consent", params=params)
-            return response.json().get("success", False)
-        except Exception:
-            logger.exception("Failed to update recommendations via %suser/log_user_cookie_consent", HOST)
-            return False
+            params = {'token': match.group(1), 'cookie_selection': 3, 'site_id': 1}
+            try:
+                response = await self.core.request(f"{HOST}user/log_user_cookie_consent", params=params)
+                return response.json().get("success", False)
+            except Exception:
+                logger.exception("Failed to update recommendations via %suser/log_user_cookie_consent", HOST)
+                return False
 
     async def get_recommended(
         self,

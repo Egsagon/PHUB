@@ -194,7 +194,7 @@ wheels = [
 
 [[package]]
 name = "eaf-base-api"
-version = "4.1.1"
+version = "4.2.0"
 source = { directory = "../eaf_base_api" }
 dependencies = [
     { name = "cachetools" },

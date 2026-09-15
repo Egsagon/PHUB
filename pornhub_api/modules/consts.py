@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import re
-import logging
+from base_api.modules.logger import get_logger
 from typing import Any
 from selectolax.lexbor import LexborHTMLParser
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 HEADERS = {
     'Accept': '*/*',
